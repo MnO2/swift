@@ -841,18 +841,47 @@ static void diagRecursivePropertyAccess(TypeChecker &TC, const Expr *E,
   const_cast<Expr *>(E)->walk(walker);
 }
 
+namespace {
+  struct RetainCycleOwner {
+    RetainCycleOwner() : Variable(nullptr), Indirect(false) {}
+    VarDecl *Variable;
+    bool Indirect;
+  };
+} // end anonymous namespace
+
 /// Look for any property references in closures that lack a "self." qualifier.
 /// Within a closure, we require that the source code contain "self." explicitly
 /// because 'self' is captured, not the property value.  This is a common source
 /// of confusion, so we force an explicit self.
-static void diagnoseImplicitSelfUseInClosure(TypeChecker &TC, const Expr *E,
-                                             const DeclContext *DC) {
+///
+/// Also perform primitive checks for reference cycles and warn the user.
+static void diagnoseVarUseInClosure(TypeChecker &TC, const Expr *E,
+                                    const DeclContext *DC) {
   class DiagnoseWalker : public ASTWalker {
     TypeChecker &TC;
-    unsigned InClosure;
+    SmallVector<AbstractClosureExpr *, 4> ClosureStack;
   public:
-    explicit DiagnoseWalker(TypeChecker &TC, bool isAlreadyInClosure)
-        : TC(TC), InClosure(isAlreadyInClosure) {}
+    explicit DiagnoseWalker(TypeChecker &TC, AbstractClosureExpr *isAlreadyInClosure)
+        : TC(TC) {
+          if (isAlreadyInClosure)
+            ClosureStack.push_back(isAlreadyInClosure);
+        }
+
+    /// Consider whether capturing the given variable can possibly lead to
+    /// a retain cycle.
+    static bool considerVariable(VarDecl *var, Expr *ref, RetainCycleOwner &owner) {
+      // Only variables captured by value qualify.
+      if (!var->getType()->hasReferenceSemantics())
+        return false;
+
+      // It's captured strongly iff the variable has strong lifetime.
+      if (auto *OA = var->getAttrs().getAttribute<OwnershipAttr>())
+        if (OA->get() != Ownership::Strong)
+          return false;
+
+      owner.Variable = var;
+      return true;
+    }
 
     /// Return true if this is an implicit reference to self.
     static bool isImplicitSelfUse(Expr *E) {
@@ -879,27 +908,79 @@ static void diagnoseImplicitSelfUseInClosure(TypeChecker &TC, const Expr *E,
       return false;
     }
 
+    static bool findRetainCycleOwner(TypeChecker &TC, Expr *E,
+                                     RetainCycleOwner &Owner) {
+      while (true) {
+        E = E->getSemanticsProvidingExpr();
+
+        if (DotSyntaxCallExpr *call = dyn_cast<DotSyntaxCallExpr>(E)) {
+          E = call->getArg();
+          continue;
+        }
+
+        if (auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+          VarDecl *VD = dyn_cast<VarDecl>(DRE->getDecl());
+          if (!VD) return false;
+          return considerVariable(VD, DRE, Owner);
+        }
+
+        if (auto *MRE = dyn_cast<MemberRefExpr>(E)) {
+          if (MRE->isImplicit()) return false;
+
+          VarDecl *property = dyn_cast<VarDecl>(MRE->getMember().getDecl());
+          if (auto *OA = property->getAttrs().getAttribute<OwnershipAttr>())
+            if (OA->get() != Ownership::Strong)
+              return false;
+
+          Owner.Indirect = true;
+          E = MRE->getBase();
+          continue;
+        }
+
+        return false;
+      }
+    }
+
+    /// Check whether the given argument is a block which captures a
+    /// variable.
+    static Expr *findCapturingExpr(TypeChecker &TC, Expr *E, RetainCycleOwner &Owner) {
+      assert(Owner.Variable);
+
+      E = E->getSemanticsProvidingExpr();
+      auto *ACLE = dyn_cast<AbstractClosureExpr>(E);
+      if (!ACLE) {
+        return nullptr;
+      }
+      // FIXME: Whoo boy, this is gonna get expensive.
+      TC.computeCaptures(ACLE);
+      for (auto &cap : ACLE->getCaptureInfo().getCaptures()) {
+        if (cap.getDecl() == Owner.Variable)
+          return E;
+      }
+
+      return nullptr;
+    }
+
     std::pair<bool, Expr *> walkToExprPre(Expr *E) override {
       if (auto *CE = dyn_cast<AbstractClosureExpr>(E)) {
         if (!CE->hasSingleExpressionBody())
           return { false, E };
-
         // If this is a potentially-escaping closure expression, start looking
         // for references to self if we aren't already.
-        if (isClosureRequiringSelfQualification(CE))
-          ++InClosure;
+        if (isClosureRequiringSelfQualification(CE)) {
+          ClosureStack.push_back(CE);
+        }
       }
 
-
       // If we aren't in a closure, no diagnostics will be produced.
-      if (!InClosure)
+      if (ClosureStack.empty())
         return { true, E };
 
       // If we see a property reference with an implicit base from within a
       // closure, then reject it as requiring an explicit "self." qualifier.  We
       // do this in explicit closures, not autoclosures, because otherwise the
       // transparence of autoclosures is lost.
-      if (auto *MRE = dyn_cast<MemberRefExpr>(E))
+      if (auto *MRE = dyn_cast<MemberRefExpr>(E)) {
         if (isImplicitSelfUse(MRE->getBase())) {
           TC.diagnose(MRE->getLoc(),
                       diag::property_use_in_closure_without_explicit_self,
@@ -907,6 +988,25 @@ static void diagnoseImplicitSelfUseInClosure(TypeChecker &TC, const Expr *E,
             .fixItInsert(MRE->getLoc(), "self.");
           return { false, E };
         }
+
+        // If the member we're referencing is a variable, try to see if it's
+        // captured.
+        if (isa<VarDecl>(MRE->getMember().getDecl())) {
+          RetainCycleOwner Owner;
+          if (!findRetainCycleOwner(TC, MRE, Owner))
+            return { true, E };
+
+          if (Expr *capturer =
+                findCapturingExpr(TC, ClosureStack.back(), Owner)) {
+            TC.diagnose(MRE->getLoc(),
+                        diag::warn_retain_cycle,
+                        Owner.Variable->getName());
+            TC.diagnose(capturer->getLoc(),
+                        diag::note_retain_cycle_owner,
+                        Owner.Indirect);
+          }
+        }
+      }
 
       // Handle method calls with a specific diagnostic + fixit.
       if (auto *DSCE = dyn_cast<DotSyntaxCallExpr>(E))
@@ -920,6 +1020,24 @@ static void diagnoseImplicitSelfUseInClosure(TypeChecker &TC, const Expr *E,
           return { false, E };
         }
 
+
+      if (auto *CE = dyn_cast<CallExpr>(E)) {
+        // Try to find a variable that the receiver is strongly owned by.
+        RetainCycleOwner owner;
+        if (!findRetainCycleOwner(TC, CE->getFn(), owner))
+          return { true, E };
+
+        if (Expr *capturer =
+            findCapturingExpr(TC, ClosureStack.back(), owner)) {
+          TC.diagnose(CE->getLoc(),
+                      diag::warn_retain_cycle,
+                      owner.Variable->getName());
+          TC.diagnose(capturer->getLoc(),
+                      diag::note_retain_cycle_owner,
+                      owner.Indirect);
+        }
+      }
+
       // Catch any other implicit uses of self with a generic diagnostic.
       if (isImplicitSelfUse(E))
         TC.diagnose(E->getLoc(), diag::implicit_use_of_self_in_closure);
@@ -930,8 +1048,8 @@ static void diagnoseImplicitSelfUseInClosure(TypeChecker &TC, const Expr *E,
     Expr *walkToExprPost(Expr *E) override {
       if (auto *CE = dyn_cast<AbstractClosureExpr>(E)) {
         if (isClosureRequiringSelfQualification(CE)) {
-          assert(InClosure);
-          --InClosure;
+          assert(!ClosureStack.empty());
+          ClosureStack.pop_back();
         }
       }
       
@@ -939,12 +1057,12 @@ static void diagnoseImplicitSelfUseInClosure(TypeChecker &TC, const Expr *E,
     }
   };
 
-  bool isAlreadyInClosure = false;
+  AbstractClosureExpr *isAlreadyInClosure = nullptr;
   if (DC->isLocalContext()) {
     while (DC->getParent()->isLocalContext() && !isAlreadyInClosure) {
       if (auto *closure = dyn_cast<AbstractClosureExpr>(DC))
         if (DiagnoseWalker::isClosureRequiringSelfQualification(closure))
-          isAlreadyInClosure = true;
+          isAlreadyInClosure = const_cast<AbstractClosureExpr *>(closure);
       DC = DC->getParent();
     }
   }
@@ -3805,7 +3923,7 @@ void swift::performSyntacticExprDiagnostics(TypeChecker &TC, const Expr *E,
   diagSelfAssignment(TC, E);
   diagSyntacticUseRestrictions(TC, E, DC, isExprStmt);
   diagRecursivePropertyAccess(TC, E, DC);
-  diagnoseImplicitSelfUseInClosure(TC, E, DC);
+  diagnoseVarUseInClosure(TC, E, DC);
   diagnoseUnintendedOptionalBehavior(TC, E, DC);
   if (!TC.getLangOpts().DisableAvailabilityChecking)
     diagAvailability(TC, E, const_cast<DeclContext*>(DC));
